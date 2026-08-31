@@ -4,8 +4,10 @@ Remote MCP server that lets Claude invoke third-party models (Grok, GPT, Gemini,
 
 ## Tools exposed
 
-- **ask_model** — `{ model, prompt, system?, temperature?, max_tokens? }` → model reply + token/cost footer
+- **ask_model** — `{ model, prompt, system?, temperature?, max_tokens?, chat_id? }` → model reply + token/cost footer. Pass `chat_id` (any string you invent) to make the conversation sticky: the server keeps the transcript and replays it on every call, so the model remembers earlier turns. Different calls on one chat may use different models — they share the transcript.
 - **list_models** — `{ search?, limit? }` → matching OpenRouter model IDs with context length and pricing
+- **list_chats** — active sticky chats with turn count, last model, total cost, last activity
+- **get_chat** — `{ chat_id }` → full transcript of one sticky chat
 
 ## Deploy (Render)
 
@@ -32,5 +34,6 @@ No OAuth config needed — the token in the path is the auth. Then in any chat, 
 ## Notes
 
 - **Stateless transport**: every request builds a fresh server instance. No sessions to lose when Render cold-starts or Starlink blips.
+- **Sticky chats are in-memory only**: they survive across requests but are lost on restart/redeploy (and Render free-tier sleep). Capped at 100 chats / 200 messages each, LRU-evicted. A failed model call never creates or grows a chat.
 - The secret lives in the URL path, so treat the connector URL itself as a credential. Rotate `AUTH_TOKEN` if it leaks.
 - Free-tier Render sleeps after idle; first call after a nap takes ~30s. Fine for this use case.

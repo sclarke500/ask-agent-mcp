@@ -42,10 +42,42 @@ async function orFetch(path, options = {}) {
   return body;
 }
 
+
+// ---------------------------------------------------------------- chat store
+//
+// Sticky conversations, in memory. The MCP transport stays stateless (fresh
+// server per request); this Map lives at module scope, so history survives
+// across requests — but not restarts/redeploys. Fine for second opinions.
+
+const MAX_CHATS = 100; // LRU-evicted beyond this
+const MAX_MESSAGES = 200; // per chat; oldest turns trimmed
+
+const chats = new Map(); // chat_id → { system, messages, createdAt, updatedAt, lastModel, cost }
+
+function getOrCreateChat(id) {
+  let c = chats.get(id);
+  if (!c) {
+    if (chats.size >= MAX_CHATS) {
+      const lru = [...chats.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt)[0];
+      if (lru) chats.delete(lru[0]);
+    }
+    c = {
+      system: null,
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastModel: null,
+      cost: 0,
+    };
+    chats.set(id, c);
+  }
+  return c;
+}
+
 // ---------------------------------------------------------------- MCP server
 
 function buildServer() {
-  const server = new McpServer({ name: "openrouter-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "openrouter-mcp", version: "1.1.0" });
 
   server.registerTool(
     "ask_model",
@@ -54,18 +86,34 @@ function buildServer() {
       description:
         "Send a prompt to a third-party model via OpenRouter and return its reply. " +
         "Use full OpenRouter model IDs, e.g. 'x-ai/grok-4', 'openai/gpt-5.1', " +
-        "'google/gemini-2.5-pro'. If unsure of an ID, call list_models first.",
+        "'google/gemini-2.5-pro'. If unsure of an ID, call list_models first. " +
+        "Pass chat_id to make the conversation sticky: the server keeps the message " +
+        "history and replays it each call, so the model remembers earlier turns.",
       inputSchema: {
         model: z.string().describe("OpenRouter model ID, e.g. x-ai/grok-4"),
         prompt: z.string().describe("The user-role message to send"),
         system: z.string().optional().describe("Optional system prompt"),
         temperature: z.number().min(0).max(2).optional(),
         max_tokens: z.number().int().positive().max(16000).default(2048),
+        chat_id: z
+          .string()
+          .max(120)
+          .optional()
+          .describe(
+            "Sticky conversation id, e.g. 'grok-db-templates'. Auto-created on first " +
+            "use; lives in server memory until restart. Different calls on the same " +
+            "chat may use different models (they share the transcript)."
+          ),
       },
     },
-    async ({ model, prompt, system, temperature, max_tokens }) => {
+    async ({ model, prompt, system, temperature, max_tokens, chat_id }) => {
+      // Read history if the chat exists; only persist after a successful reply,
+      // so failed calls never mint empty chats.
+      const prior = chat_id ? chats.get(chat_id) : undefined;
+      const effectiveSystem = system ?? prior?.system;
       const messages = [];
-      if (system) messages.push({ role: "system", content: system });
+      if (effectiveSystem) messages.push({ role: "system", content: effectiveSystem });
+      if (prior) messages.push(...prior.messages);
       messages.push({ role: "user", content: prompt });
 
       const data = await orFetch("/chat/completions", {
@@ -82,10 +130,25 @@ function buildServer() {
       const choice = data.choices?.[0];
       const text = choice?.message?.content ?? "(empty response)";
       const u = data.usage || {};
+      const chat = chat_id ? getOrCreateChat(chat_id) : null;
+      if (chat) {
+        if (system) chat.system = system; // latest system wins for the whole chat
+        chat.messages.push(
+          { role: "user", content: prompt },
+          { role: "assistant", content: text }
+        );
+        while (chat.messages.length > MAX_MESSAGES) chat.messages.splice(0, 2);
+        chat.updatedAt = Date.now();
+        chat.lastModel = data.model;
+        if (typeof u.cost === "number") chat.cost += u.cost;
+      }
       const meta =
         `\n\n---\nmodel: ${data.model} | finish: ${choice?.finish_reason}` +
         ` | tokens: ${u.prompt_tokens ?? "?"} in / ${u.completion_tokens ?? "?"} out` +
-        (u.cost !== undefined ? ` | cost: $${u.cost}` : "");
+        (u.cost !== undefined ? ` | cost: $${u.cost}` : "") +
+        (chat
+          ? ` | chat: ${chat_id} (${chat.messages.length / 2} turns, $${chat.cost.toFixed(4)} total)`
+          : "");
 
       return { content: [{ type: "text", text: text + meta }] };
     }
@@ -135,6 +198,50 @@ function buildServer() {
           },
         ],
       };
+    }
+  );
+
+  server.registerTool(
+    "list_chats",
+    {
+      title: "List sticky chats",
+      description:
+        "List active sticky chat ids with turn count, last model, total cost, and " +
+        "last activity. Chats live in server memory only — a restart clears them.",
+      inputSchema: {},
+    },
+    async () => {
+      const lines = [...chats.entries()]
+        .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+        .map(
+          ([id, c]) =>
+            `${id} — ${c.messages.length / 2} turn(s) — last model ${c.lastModel ?? "?"}` +
+            ` — $${c.cost.toFixed(4)} — updated ${new Date(c.updatedAt).toISOString()}`
+        );
+      return {
+        content: [{ type: "text", text: lines.length ? lines.join("\n") : "No active chats." }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "get_chat",
+    {
+      title: "Read a chat transcript",
+      description: "Return the full message history of one sticky chat (see list_chats).",
+      inputSchema: {
+        chat_id: z.string().describe("Chat id passed to ask_model"),
+      },
+    },
+    async ({ chat_id }) => {
+      const c = chats.get(chat_id);
+      if (!c) {
+        return { content: [{ type: "text", text: `No chat "${chat_id}".` }] };
+      }
+      const lines = [];
+      if (c.system) lines.push(`[system] ${c.system}`);
+      for (const m of c.messages) lines.push(`[${m.role}] ${m.content}`);
+      return { content: [{ type: "text", text: lines.join("\n\n") }] };
     }
   );
 
