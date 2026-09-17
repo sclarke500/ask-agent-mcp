@@ -1,5 +1,7 @@
 // openrouter-mcp — remote MCP server that exposes third-party models
-// (Grok, GPT, Gemini, whatever OpenRouter carries) as tools for Claude.
+// (Grok, GPT, Gemini, whatever OpenRouter carries) as tools for Claude,
+// plus a keyless market-quote tool (Yahoo for equities/indices/crypto,
+// Bank of Canada + ECB reference rates for FX).
 //
 // Auth model: the OpenRouter key lives ONLY here (env var). Claude connects
 // via a secret path segment: https://your-host/mcp/<AUTH_TOKEN>
@@ -42,6 +44,283 @@ async function orFetch(path, options = {}) {
   return body;
 }
 
+
+// ---------------------------------------------------------------- rate limiter
+//
+// App-wide token bucket, shared by every MCP request (module scope survives
+// across the stateless per-request server instances). Callers await acquire()
+// before each upstream hit; it serialises them, enforces a minimum gap, and
+// refills tokens over time. Waiting longer than maxWaitMs fails fast so an MCP
+// call never hangs.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+class RateLimiter {
+  constructor({ name, capacity, refillPerSec, minGapMs, maxWaitMs }) {
+    Object.assign(this, { name, capacity, refillPerSec, minGapMs, maxWaitMs });
+    this.tokens = capacity;
+    this.lastRefill = Date.now();
+    this.nextAllowedAt = 0;
+    this.queue = Promise.resolve();
+  }
+
+  #refill() {
+    const now = Date.now();
+    this.tokens = Math.min(this.capacity, this.tokens + ((now - this.lastRefill) / 1000) * this.refillPerSec);
+    this.lastRefill = now;
+  }
+
+  acquire() {
+    const enqueuedAt = Date.now();
+    const run = async () => {
+      this.#refill();
+      let waitMs = Math.max(0, this.nextAllowedAt - Date.now());
+      if (this.tokens < 1) {
+        waitMs = Math.max(waitMs, ((1 - this.tokens) / this.refillPerSec) * 1000);
+      }
+      if (Date.now() + waitMs - enqueuedAt > this.maxWaitMs) {
+        throw new Error(`${this.name} request budget exhausted; try again in a minute`);
+      }
+      if (waitMs > 0) await sleep(waitMs);
+      this.#refill();
+      this.tokens -= 1;
+      this.nextAllowedAt = Date.now() + this.minGapMs;
+    };
+    const turn = this.queue.then(run, run);
+    this.queue = turn.catch(() => {});
+    return turn;
+  }
+}
+
+// Yahoo: undocumented, per-IP, TLS-fingerprinted (Node's fetch lands in the
+// tight "non-browser" bucket), lockouts of 13–40+ min that escalate if you keep
+// knocking. Observed: ~10–15 requests in a few seconds trips it. So: never more
+// than one Yahoo request per second, server-wide, serialised. A cold 25-symbol
+// call therefore takes ~25 s, just inside the 30 s fail-fast ceiling.
+const yahooLimiter = new RateLimiter({
+  name: "Yahoo",
+  capacity: 8,
+  refillPerSec: 1,
+  minGapMs: 1000,
+  maxWaitMs: 30_000,
+});
+
+// Bank of Canada / ECB: official public APIs, no published limit; be polite.
+const fxLimiter = new RateLimiter({
+  name: "FX",
+  capacity: 5,
+  refillPerSec: 2,
+  minGapMs: 100,
+  maxWaitMs: 30_000,
+});
+
+// ---------------------------------------------------------------- quote cache
+
+const quoteCache = new Map(); // SYMBOL → { quote, fetchedAt }
+
+function cachedQuote(symbol, maxAgeMs) {
+  const c = quoteCache.get(symbol);
+  return c && Date.now() - c.fetchedAt <= maxAgeMs ? c.quote : null;
+}
+
+function rememberQuote(symbol, quote) {
+  quoteCache.set(symbol, { quote, fetchedAt: Date.now() });
+  return quote;
+}
+
+// ---------------------------------------------------------------- Yahoo quotes
+//
+// Unofficial, keyless chart endpoint. One request per symbol (the batched v7
+// /quote endpoint now demands a cookie crumb). Equities, ETFs, indices (^GSPC),
+// crypto (BTC-USD), and FX as a fallback. Besides the limiter above: browser
+// UA (non-browser UAs are 429'd outright), a short cache, and a circuit breaker
+// that backs off exponentially after a 429 (serving stale cache meanwhile).
+
+const YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
+const YF_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36";
+const YF_TIMEOUT_MS = 10_000;
+const YF_FRESH_MS = 30_000; // serve from cache without asking Yahoo
+const YF_STALE_MS = 10 * 60_000; // serve stale (flagged) only while blocked
+const YF_BLOCK_MIN_MS = 60_000; // first back-off after a 429 …
+const YF_BLOCK_MAX_MS = 30 * 60_000; // … doubling on repeat 429s up to this
+
+let yfBlockedUntil = 0;
+let yfBlockMs = YF_BLOCK_MIN_MS;
+
+function tripBreaker() {
+  yfBlockedUntil = Date.now() + yfBlockMs;
+  yfBlockMs = Math.min(yfBlockMs * 2, YF_BLOCK_MAX_MS);
+}
+
+function rateLimitError() {
+  return new Error(
+    `Yahoo rate-limited this server (429); retry after ${new Date(yfBlockedUntil).toISOString()}`
+  );
+}
+
+// Yahoo's chart meta has no marketState field; derive it from the session
+// boundaries it does give us. FX/crypto have zero-length pre/post windows and
+// hasPrePostMarketData=false, so they only ever read REGULAR or CLOSED.
+function deriveMarketState(meta, nowSec) {
+  const p = meta.currentTradingPeriod;
+  if (!p?.regular) return "UNKNOWN";
+  if (nowSec >= p.regular.start && nowSec < p.regular.end) return "REGULAR";
+  if (meta.hasPrePostMarketData) {
+    if (p.pre && nowSec >= p.pre.start && nowSec < p.pre.end) return "PRE";
+    if (p.post && nowSec >= p.post.start && nowSec < p.post.end) return "POST";
+  }
+  return "CLOSED";
+}
+
+async function fetchYahooQuote(symbol) {
+  const fresh = cachedQuote(symbol, YF_FRESH_MS);
+  if (fresh) return fresh;
+
+  await yahooLimiter.acquire();
+
+  // Check the breaker *after* queueing: an earlier item in the queue may have
+  // just tripped it.
+  if (Date.now() < yfBlockedUntil) {
+    const stale = cachedQuote(symbol, YF_STALE_MS);
+    if (stale) return { ...stale, stale: true };
+    throw rateLimitError();
+  }
+
+  const url = `${YF_BASE}/${encodeURIComponent(symbol)}?range=1d&interval=1d`;
+  const res = await fetch(url, {
+    headers: { "User-Agent": YF_UA, Accept: "application/json" },
+    signal: AbortSignal.timeout(YF_TIMEOUT_MS),
+  });
+  if (res.status === 429) {
+    tripBreaker();
+    const stale = cachedQuote(symbol, YF_STALE_MS);
+    if (stale) return { ...stale, stale: true };
+    throw rateLimitError();
+  }
+  const body = await res.json().catch(() => ({}));
+  const err = body?.chart?.error;
+  if (err) throw new Error(`${err.code}: ${err.description}`);
+  if (!res.ok) throw new Error(`Yahoo ${res.status}: ${res.statusText}`);
+  const meta = body?.chart?.result?.[0]?.meta;
+  if (!meta || typeof meta.regularMarketPrice !== "number") {
+    throw new Error("No quote data in response");
+  }
+  yfBlockMs = YF_BLOCK_MIN_MS; // a success resets the back-off ladder
+  return rememberQuote(symbol, {
+    symbol: meta.symbol ?? symbol,
+    name: meta.shortName ?? meta.longName ?? null,
+    price: meta.regularMarketPrice,
+    prevClose: meta.previousClose ?? meta.chartPreviousClose ?? null,
+    marketState: deriveMarketState(meta, Math.floor(Date.now() / 1000)),
+    asOfISO: meta.regularMarketTime
+      ? new Date(meta.regularMarketTime * 1000).toISOString()
+      : null,
+    dayHigh: meta.regularMarketDayHigh ?? null,
+    dayLow: meta.regularMarketDayLow ?? null,
+    currency: meta.currency ?? null,
+    source: "yahoo",
+  });
+}
+
+// ---------------------------------------------------------------- FX quotes
+//
+// FX pairs go to official, keyless daily-reference sources instead of Yahoo:
+// Bank of Canada Valet for anything involving CAD (27 currencies, daily
+// average), ECB via Frankfurter for the rest (29 currencies). Both publish one
+// rate per business day, so marketState is "REFERENCE" and asOfISO is a date.
+// Pairs neither covers fall back to Yahoo's intraday =X ticker.
+
+const FX_FRESH_MS = 60 * 60_000; // daily rates: an hour of cache is plenty
+const FX_TIMEOUT_MS = 10_000;
+const BOC_BASE = "https://www.bankofcanada.ca/valet/observations";
+const ECB_BASE = "https://api.frankfurter.dev/v1";
+
+// "USDCAD=X" (Yahoo form) or "USD/CAD" → { base, quote }; anything else → null.
+function parseFxPair(symbol) {
+  const m = /^([A-Z]{3})\/?([A-Z]{3})=?X?$/.exec(symbol);
+  if (!m) return null;
+  // Guard against 6-letter equity tickers matching: require the =X or slash.
+  if (!/=X$|\//.test(symbol)) return null;
+  return { base: m[1], quote: m[2] };
+}
+
+async function fxJson(url) {
+  await fxLimiter.acquire();
+  const res = await fetch(url, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(FX_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`${new URL(url).host} ${res.status}`);
+  return res.json();
+}
+
+function fxQuote(symbol, { base, quote }, price, prevClose, date, source) {
+  const round = (v) => (v == null ? null : Number(v.toPrecision(6)));
+  return {
+    symbol,
+    name: `${base}/${quote}`,
+    price: round(price),
+    prevClose: round(prevClose),
+    marketState: "REFERENCE",
+    asOfISO: date,
+    dayHigh: null,
+    dayLow: null,
+    currency: quote,
+    source,
+  };
+}
+
+// BoC series are all FX<CCY>CAD (1 unit of CCY in CAD); invert for CAD<CCY>.
+async function fetchBocFx(symbol, pair) {
+  const foreign = pair.base === "CAD" ? pair.quote : pair.base;
+  const data = await fxJson(`${BOC_BASE}/FX${foreign}CAD/json?recent=2`);
+  const obs = (data.observations ?? []).map((o) => ({
+    date: o.d,
+    v: Number(o[`FX${foreign}CAD`]?.v),
+  }));
+  if (!obs.length || !Number.isFinite(obs[0].v)) throw new Error("No BoC observation");
+  const conv = (v) => (pair.base === "CAD" ? 1 / v : v);
+  return fxQuote(symbol, pair, conv(obs[0].v), obs[1] ? conv(obs[1].v) : null, obs[0].date, "bank-of-canada");
+}
+
+async function fetchEcbFx(symbol, pair) {
+  const from = new Date(Date.now() - 10 * 86_400_000).toISOString().slice(0, 10);
+  const data = await fxJson(`${ECB_BASE}/${from}..?base=${pair.base}&symbols=${pair.quote}`);
+  const dates = Object.keys(data.rates ?? {}).sort();
+  if (!dates.length) throw new Error("No ECB observation");
+  const at = (i) => data.rates[dates[i]]?.[pair.quote];
+  const last = dates.length - 1;
+  return fxQuote(symbol, pair, at(last), last > 0 ? at(last - 1) : null, dates[last], "ecb");
+}
+
+async function fetchFxQuote(symbol, pair) {
+  const fresh = cachedQuote(symbol, FX_FRESH_MS);
+  if (fresh) return fresh;
+  try {
+    const official = pair.base === "CAD" || pair.quote === "CAD"
+      ? await fetchBocFx(symbol, pair)
+      : await fetchEcbFx(symbol, pair);
+    return rememberQuote(symbol, official);
+  } catch (err) {
+    // Not covered (or source down): Yahoo's intraday =X ticker still works.
+    return fetchYahooQuote(`${pair.base}${pair.quote}=X`);
+  }
+}
+
+// ---------------------------------------------------------------- dispatcher
+
+function normalizeSymbol(raw) {
+  const s = raw.trim().toUpperCase();
+  const m = /^([A-Z]{3})\/([A-Z]{3})$/.exec(s);
+  return m ? `${m[1]}${m[2]}=X` : s;
+}
+
+function getQuote(symbol) {
+  const pair = parseFxPair(symbol);
+  return pair ? fetchFxQuote(symbol, pair) : fetchYahooQuote(symbol);
+}
 
 // ---------------------------------------------------------------- chat store
 //
@@ -242,6 +521,45 @@ function buildServer() {
       if (c.system) lines.push(`[system] ${c.system}`);
       for (const m of c.messages) lines.push(`[${m.role}] ${m.content}`);
       return { content: [{ type: "text", text: lines.join("\n\n") }] };
+    }
+  );
+
+  server.registerTool(
+    "get_quotes",
+    {
+      title: "Get market quotes",
+      description:
+        "Fetch quotes for one or more tickers, no API key. Equities/ETFs ('AAPL', " +
+        "'SHOP.TO'), indices ('^GSPC') and crypto ('BTC-USD') come from Yahoo " +
+        "Finance, near-real-time. FX pairs ('USDCAD=X' or 'USD/CAD') come from " +
+        "official daily reference rates (Bank of Canada for CAD pairs, ECB " +
+        "otherwise; marketState 'REFERENCE', asOfISO is the date). Returns a JSON " +
+        "array with, per symbol: price, prevClose, marketState (PRE/REGULAR/POST/" +
+        "CLOSED/REFERENCE), asOfISO, dayHigh, dayLow, currency, source. During " +
+        "POST/CLOSED the price is the last regular-session trade. Unknown symbols " +
+        "come back as { symbol, error } without failing the batch. Requests to " +
+        "Yahoo are rate-limited server-wide (1/s) and cached ~30s, so a " +
+        "large cold batch can take ~25s; if Yahoo blocks the server you may get a " +
+        "cached quote flagged stale:true, or an error saying when to retry.",
+      inputSchema: {
+        symbols: z
+          .array(z.string().trim().min(1).max(20))
+          .min(1)
+          .max(25)
+          .describe("Ticker symbols, e.g. ['AAPL', 'SHOP.TO', 'USDCAD=X']"),
+      },
+    },
+    async ({ symbols }) => {
+      const unique = [...new Set(symbols.map(normalizeSymbol))];
+      const settled = await Promise.allSettled(unique.map(getQuote));
+      const quotes = settled.map((r, i) =>
+        r.status === "fulfilled"
+          ? r.value
+          : { symbol: unique[i], error: r.reason?.message ?? String(r.reason) }
+      );
+      return {
+        content: [{ type: "text", text: JSON.stringify(quotes, null, 2) }],
+      };
     }
   );
 
