@@ -164,6 +164,9 @@ async function fetchFinnhubQuote(symbol) {
     signal: AbortSignal.timeout(FH_TIMEOUT_MS),
   });
   if (res.status === 429) throw new Error("Finnhub rate limit hit (60/min); retry shortly");
+  if (res.status === 403) {
+    throw new Error("Not available on the Finnhub free tier (non-US listings such as TSX need a paid plan)");
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Finnhub ${res.status}: ${body?.error ?? res.statusText}`);
   if (typeof body.c !== "number" || (body.c === 0 && !body.t)) {
