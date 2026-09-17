@@ -1,7 +1,7 @@
 // openrouter-mcp — remote MCP server that exposes third-party models
 // (Grok, GPT, Gemini, whatever OpenRouter carries) as tools for Claude,
-// plus a keyless market-quote tool (Yahoo for equities/indices/crypto,
-// Bank of Canada + ECB reference rates for FX).
+// plus a market-quote tool (Finnhub for US equities/ETFs, Bank of Canada +
+// ECB daily reference rates for FX).
 //
 // Auth model: the OpenRouter key lives ONLY here (env var). Claude connects
 // via a secret path segment: https://your-host/mcp/<AUTH_TOKEN>
@@ -15,10 +15,11 @@ import { z } from "zod";
 const PORT = process.env.PORT || 3100;
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY;
 const OR_BASE = "https://openrouter.ai/api/v1";
 
-if (!AUTH_TOKEN || !OPENROUTER_API_KEY) {
-  console.error("Missing AUTH_TOKEN or OPENROUTER_API_KEY env vars. Refusing to start.");
+if (!AUTH_TOKEN || !OPENROUTER_API_KEY || !FINNHUB_API_KEY) {
+  console.error("Missing AUTH_TOKEN, OPENROUTER_API_KEY or FINNHUB_API_KEY env vars. Refusing to start.");
   process.exit(1);
 }
 
@@ -92,16 +93,12 @@ class RateLimiter {
   }
 }
 
-// Yahoo: undocumented, per-IP, TLS-fingerprinted (Node's fetch lands in the
-// tight "non-browser" bucket), lockouts of 13–40+ min that escalate if you keep
-// knocking. Observed: ~10–15 requests in a few seconds trips it. So: never more
-// than one Yahoo request per second, server-wide, serialised. A cold 25-symbol
-// call therefore takes ~25 s, just inside the 30 s fail-fast ceiling.
-const yahooLimiter = new RateLimiter({
-  name: "Yahoo",
-  capacity: 8,
+// Finnhub free tier: 60 calls/min, 30/s burst. Stay comfortably under.
+const finnhubLimiter = new RateLimiter({
+  name: "Finnhub",
+  capacity: 10,
   refillPerSec: 1,
-  minGapMs: 1000,
+  minGapMs: 50,
   maxWaitMs: 30_000,
 });
 
@@ -128,116 +125,77 @@ function rememberQuote(symbol, quote) {
   return quote;
 }
 
-// ---------------------------------------------------------------- Yahoo quotes
+// ---------------------------------------------------------------- Finnhub quotes
 //
-// Unofficial, keyless chart endpoint. One request per symbol (the batched v7
-// /quote endpoint now demands a cookie crumb). Equities, ETFs, indices (^GSPC),
-// crypto (BTC-USD), and FX as a fallback. Besides the limiter above: browser
-// UA (non-browser UAs are 429'd outright), a short cache, and a circuit breaker
-// that backs off exponentially after a 429 (serving stale cache meanwhile).
+// US equities and ETFs, real-time on the free tier. /quote returns
+// { c, pc, h, l, o, t } and all zeros for anything it doesn't know (or that the
+// plan doesn't cover, e.g. TSX listings), so zeros are treated as an error.
+// Finnhub doesn't report market state or currency; state is derived from
+// US-market wall-clock hours and currency is USD (free tier is US-only).
 
-const YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
-const YF_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36";
-const YF_TIMEOUT_MS = 10_000;
-const YF_FRESH_MS = 30_000; // serve from cache without asking Yahoo
-const YF_STALE_MS = 10 * 60_000; // serve stale (flagged) only while blocked
-const YF_BLOCK_MIN_MS = 60_000; // first back-off after a 429 …
-const YF_BLOCK_MAX_MS = 30 * 60_000; // … doubling on repeat 429s up to this
+const FH_BASE = "https://finnhub.io/api/v1";
+const FH_TIMEOUT_MS = 10_000;
+const FH_FRESH_MS = 30_000;
 
-let yfBlockedUntil = 0;
-let yfBlockMs = YF_BLOCK_MIN_MS;
-
-function tripBreaker() {
-  yfBlockedUntil = Date.now() + yfBlockMs;
-  yfBlockMs = Math.min(yfBlockMs * 2, YF_BLOCK_MAX_MS);
-}
-
-function rateLimitError() {
-  return new Error(
-    `Yahoo rate-limited this server (429); retry after ${new Date(yfBlockedUntil).toISOString()}`
-  );
-}
-
-// Yahoo's chart meta has no marketState field; derive it from the session
-// boundaries it does give us. FX/crypto have zero-length pre/post windows and
-// hasPrePostMarketData=false, so they only ever read REGULAR or CLOSED.
-function deriveMarketState(meta, nowSec) {
-  const p = meta.currentTradingPeriod;
-  if (!p?.regular) return "UNKNOWN";
-  if (nowSec >= p.regular.start && nowSec < p.regular.end) return "REGULAR";
-  if (meta.hasPrePostMarketData) {
-    if (p.pre && nowSec >= p.pre.start && nowSec < p.pre.end) return "PRE";
-    if (p.post && nowSec >= p.post.start && nowSec < p.post.end) return "POST";
-  }
+function usMarketState(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    hour: "numeric",
+    minute: "numeric",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t)?.value;
+  if (["Sat", "Sun"].includes(get("weekday"))) return "CLOSED";
+  const mins = (Number(get("hour")) % 24) * 60 + Number(get("minute"));
+  if (mins >= 9 * 60 + 30 && mins < 16 * 60) return "REGULAR";
+  if (mins >= 4 * 60 && mins < 9 * 60 + 30) return "PRE";
+  if (mins >= 16 * 60 && mins < 20 * 60) return "POST";
   return "CLOSED";
 }
 
-async function fetchYahooQuote(symbol) {
-  const fresh = cachedQuote(symbol, YF_FRESH_MS);
+async function fetchFinnhubQuote(symbol) {
+  const fresh = cachedQuote(symbol, FH_FRESH_MS);
   if (fresh) return fresh;
 
-  await yahooLimiter.acquire();
-
-  // Check the breaker *after* queueing: an earlier item in the queue may have
-  // just tripped it.
-  if (Date.now() < yfBlockedUntil) {
-    const stale = cachedQuote(symbol, YF_STALE_MS);
-    if (stale) return { ...stale, stale: true };
-    throw rateLimitError();
-  }
-
-  const url = `${YF_BASE}/${encodeURIComponent(symbol)}?range=1d&interval=1d`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": YF_UA, Accept: "application/json" },
-    signal: AbortSignal.timeout(YF_TIMEOUT_MS),
+  await finnhubLimiter.acquire();
+  const res = await fetch(`${FH_BASE}/quote?symbol=${encodeURIComponent(symbol)}`, {
+    headers: { "X-Finnhub-Token": FINNHUB_API_KEY, Accept: "application/json" },
+    signal: AbortSignal.timeout(FH_TIMEOUT_MS),
   });
-  if (res.status === 429) {
-    tripBreaker();
-    const stale = cachedQuote(symbol, YF_STALE_MS);
-    if (stale) return { ...stale, stale: true };
-    throw rateLimitError();
-  }
+  if (res.status === 429) throw new Error("Finnhub rate limit hit (60/min); retry shortly");
   const body = await res.json().catch(() => ({}));
-  const err = body?.chart?.error;
-  if (err) throw new Error(`${err.code}: ${err.description}`);
-  if (!res.ok) throw new Error(`Yahoo ${res.status}: ${res.statusText}`);
-  const meta = body?.chart?.result?.[0]?.meta;
-  if (!meta || typeof meta.regularMarketPrice !== "number") {
-    throw new Error("No quote data in response");
+  if (!res.ok) throw new Error(`Finnhub ${res.status}: ${body?.error ?? res.statusText}`);
+  if (typeof body.c !== "number" || (body.c === 0 && !body.t)) {
+    throw new Error("Unknown symbol, or not covered by the Finnhub free tier (US equities/ETFs only)");
   }
-  yfBlockMs = YF_BLOCK_MIN_MS; // a success resets the back-off ladder
   return rememberQuote(symbol, {
-    symbol: meta.symbol ?? symbol,
-    name: meta.shortName ?? meta.longName ?? null,
-    price: meta.regularMarketPrice,
-    prevClose: meta.previousClose ?? meta.chartPreviousClose ?? null,
-    marketState: deriveMarketState(meta, Math.floor(Date.now() / 1000)),
-    asOfISO: meta.regularMarketTime
-      ? new Date(meta.regularMarketTime * 1000).toISOString()
-      : null,
-    dayHigh: meta.regularMarketDayHigh ?? null,
-    dayLow: meta.regularMarketDayLow ?? null,
-    currency: meta.currency ?? null,
-    source: "yahoo",
+    symbol,
+    name: null,
+    price: body.c,
+    prevClose: body.pc ?? null,
+    marketState: usMarketState(),
+    asOfISO: body.t ? new Date(body.t * 1000).toISOString() : null,
+    dayHigh: body.h ?? null,
+    dayLow: body.l ?? null,
+    currency: "USD",
+    source: "finnhub",
   });
 }
 
 // ---------------------------------------------------------------- FX quotes
 //
-// FX pairs go to official, keyless daily-reference sources instead of Yahoo:
-// Bank of Canada Valet for anything involving CAD (27 currencies, daily
-// average), ECB via Frankfurter for the rest (29 currencies). Both publish one
-// rate per business day, so marketState is "REFERENCE" and asOfISO is a date.
-// Pairs neither covers fall back to Yahoo's intraday =X ticker.
+// FX pairs go to official, keyless daily-reference sources: Bank of Canada
+// Valet for anything involving CAD (27 currencies, daily average), ECB via
+// Frankfurter for the rest (29 currencies). Both publish one rate per business
+// day, so marketState is "REFERENCE" and asOfISO is a date.
 
 const FX_FRESH_MS = 60 * 60_000; // daily rates: an hour of cache is plenty
 const FX_TIMEOUT_MS = 10_000;
 const BOC_BASE = "https://www.bankofcanada.ca/valet/observations";
 const ECB_BASE = "https://api.frankfurter.dev/v1";
 
-// "USDCAD=X" (Yahoo form) or "USD/CAD" → { base, quote }; anything else → null.
+// "USDCAD=X" (Yahoo-style) or "USD/CAD" → { base, quote }; anything else → null.
 function parseFxPair(symbol) {
   const m = /^([A-Z]{3})\/?([A-Z]{3})=?X?$/.exec(symbol);
   if (!m) return null;
@@ -299,13 +257,12 @@ async function fetchFxQuote(symbol, pair) {
   const fresh = cachedQuote(symbol, FX_FRESH_MS);
   if (fresh) return fresh;
   try {
-    const official = pair.base === "CAD" || pair.quote === "CAD"
+    const q = pair.base === "CAD" || pair.quote === "CAD"
       ? await fetchBocFx(symbol, pair)
       : await fetchEcbFx(symbol, pair);
-    return rememberQuote(symbol, official);
+    return rememberQuote(symbol, q);
   } catch (err) {
-    // Not covered (or source down): Yahoo's intraday =X ticker still works.
-    return fetchYahooQuote(`${pair.base}${pair.quote}=X`);
+    throw new Error(`FX pair not available from Bank of Canada or ECB (${err.message})`);
   }
 }
 
@@ -319,7 +276,7 @@ function normalizeSymbol(raw) {
 
 function getQuote(symbol) {
   const pair = parseFxPair(symbol);
-  return pair ? fetchFxQuote(symbol, pair) : fetchYahooQuote(symbol);
+  return pair ? fetchFxQuote(symbol, pair) : fetchFinnhubQuote(symbol);
 }
 
 // ---------------------------------------------------------------- chat store
@@ -529,24 +486,22 @@ function buildServer() {
     {
       title: "Get market quotes",
       description:
-        "Fetch quotes for one or more tickers, no API key. Equities/ETFs ('AAPL', " +
-        "'SHOP.TO'), indices ('^GSPC') and crypto ('BTC-USD') come from Yahoo " +
-        "Finance, near-real-time. FX pairs ('USDCAD=X' or 'USD/CAD') come from " +
-        "official daily reference rates (Bank of Canada for CAD pairs, ECB " +
-        "otherwise; marketState 'REFERENCE', asOfISO is the date). Returns a JSON " +
-        "array with, per symbol: price, prevClose, marketState (PRE/REGULAR/POST/" +
-        "CLOSED/REFERENCE), asOfISO, dayHigh, dayLow, currency, source. During " +
-        "POST/CLOSED the price is the last regular-session trade. Unknown symbols " +
-        "come back as { symbol, error } without failing the batch. Requests to " +
-        "Yahoo are rate-limited server-wide (1/s) and cached ~30s, so a " +
-        "large cold batch can take ~25s; if Yahoo blocks the server you may get a " +
-        "cached quote flagged stale:true, or an error saying when to retry.",
+        "Fetch quotes for one or more tickers. US equities and ETFs ('AAPL', " +
+        "'VOO') come from Finnhub, real-time. FX pairs ('USDCAD=X' or 'USD/CAD') " +
+        "come from official daily reference rates (Bank of Canada for CAD pairs, " +
+        "ECB otherwise; marketState 'REFERENCE', asOfISO is the date). Returns a " +
+        "JSON array with, per symbol: price, prevClose, marketState (PRE/REGULAR/" +
+        "POST/CLOSED/REFERENCE), asOfISO, dayHigh, dayLow, currency, source. " +
+        "Outside REGULAR hours the equity price is the last trade. Non-US " +
+        "listings (e.g. TSX 'SHOP.TO'), indices and crypto are not covered; " +
+        "unknown or uncovered symbols come back as { symbol, error } without " +
+        "failing the batch. Quotes are cached ~30s.",
       inputSchema: {
         symbols: z
           .array(z.string().trim().min(1).max(20))
           .min(1)
           .max(25)
-          .describe("Ticker symbols, e.g. ['AAPL', 'SHOP.TO', 'USDCAD=X']"),
+          .describe("Ticker symbols, e.g. ['AAPL', 'VOO', 'USD/CAD']"),
       },
     },
     async ({ symbols }) => {

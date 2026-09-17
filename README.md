@@ -1,6 +1,6 @@
 # openrouter-mcp
 
-Remote MCP server that lets Claude invoke third-party models (Grok, GPT, Gemini, DeepSeek — anything OpenRouter carries) as tools mid-conversation, plus fetch live market quotes. The OpenRouter API key never leaves this server.
+Remote MCP server that lets Claude invoke third-party models (Grok, GPT, Gemini, DeepSeek — anything OpenRouter carries) as tools mid-conversation, plus fetch live market quotes. The API keys never leave this server.
 
 ## Tools exposed
 
@@ -8,7 +8,7 @@ Remote MCP server that lets Claude invoke third-party models (Grok, GPT, Gemini,
 - **list_models** — `{ search?, limit? }` → matching OpenRouter model IDs with context length and pricing
 - **list_chats** — active sticky chats with turn count, last model, total cost, last activity
 - **get_chat** — `{ chat_id }` → full transcript of one sticky chat
-- **get_quotes** — `{ symbols: string[] }` → JSON array of `{ symbol, name, price, prevClose, marketState, asOfISO, dayHigh, dayLow, currency, source }` per ticker, no API key. Equities/ETFs (`AAPL`, `SHOP.TO`), indices (`^GSPC`) and crypto (`BTC-USD`) come from Yahoo Finance's unofficial chart endpoint, near-real-time; `marketState` is PRE/REGULAR/POST/CLOSED (derived from the session windows Yahoo returns) and in POST/CLOSED `price` is the last regular-session trade. FX pairs (`USDCAD=X` or `USD/CAD`) come from official daily reference rates instead — Bank of Canada for anything involving CAD, ECB (via Frankfurter) otherwise — with `marketState: "REFERENCE"` and `asOfISO` as the date; pairs neither covers fall back to Yahoo. Unknown tickers come back as `{ symbol, error }` without failing the rest of the batch. Up to 25 symbols per call.
+- **get_quotes** — `{ symbols: string[] }` → JSON array of `{ symbol, price, prevClose, marketState, asOfISO, dayHigh, dayLow, currency, source }` per ticker. US equities and ETFs (`AAPL`, `VOO`) come from Finnhub, real-time on the free tier; `marketState` (PRE/REGULAR/POST/CLOSED) is derived from US market hours and `currency` is USD. FX pairs (`USDCAD=X` or `USD/CAD`) come from official, keyless daily reference rates — Bank of Canada for anything involving CAD, ECB (via Frankfurter) otherwise — with `marketState: "REFERENCE"` and `asOfISO` as the date. Not covered: non-US listings such as TSX (Finnhub free tier is US-only), indices, crypto. Unknown or uncovered tickers come back as `{ symbol, error }` without failing the rest of the batch. Up to 25 symbols per call, cached 30 s (FX 1 h).
 
 ## Deploy (Render)
 
@@ -16,6 +16,7 @@ Remote MCP server that lets Claude invoke third-party models (Grok, GPT, Gemini,
    - Build: `npm install` · Start: `npm start` (Render injects `PORT`)
 2. Environment variables:
    - `OPENROUTER_API_KEY` — from https://openrouter.ai/keys (set a spend limit on the key)
+   - `FINNHUB_API_KEY` — free at https://finnhub.io/register (60 calls/min, no card)
    - `AUTH_TOKEN` — generate one: `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`
    - `APP_URL` — optional, your Render URL (OpenRouter attribution header)
 3. Sanity check: `GET https://your-app.onrender.com/healthz` → `{"ok":true}`
@@ -37,10 +38,5 @@ No OAuth config needed — the token in the path is the auth. Then in any chat, 
 - **Stateless transport**: every request builds a fresh server instance. No sessions to lose when Render cold-starts or Starlink blips.
 - **Sticky chats are in-memory only**: they survive across requests but are lost on restart/redeploy (and Render free-tier sleep). Capped at 100 chats / 200 messages each, LRU-evicted. A failed model call never creates or grows a chat.
 - The secret lives in the URL path, so treat the connector URL itself as a credential. Rotate `AUTH_TOKEN` if it leaks.
-- **Yahoo quotes are unofficial**: no API key, no TOS, no SLA, and no documented limits — everything known is reverse-engineered by the yfinance community. Yahoo 429s non-browser user agents outright (the server sends a browser UA), TLS-fingerprints clients so Node's `fetch` gets a tighter budget than a real browser, and hard-blocks an IP for 13–40+ minutes after a burst of roughly 10–15 quick requests, escalating if you keep knocking. Defences, all server-wide (shared across every connected consumer):
-  - **Rate limiter**: never more than one Yahoo request per second, server-wide, serialised through a shared queue (a token bucket behind it caps sustained load at 60/min). A cold 25-symbol call takes ~25 s; anything that would wait over 30 s fails fast instead of hanging.
-  - **Cache**: Yahoo quotes 30 s, FX reference rates 1 h.
-  - **Circuit breaker**: after any 429 the server stops calling Yahoo for 60 s, doubling on each consecutive 429 up to 30 min. During the block it returns cached quotes up to 10 min old flagged `stale: true`, or `{ symbol, error: "Yahoo rate-limited ... retry after <ISO>" }`.
-  - **FX off Yahoo entirely**: Bank of Canada Valet and ECB/Frankfurter are official, keyless, and have real terms of service. They publish one rate per business day, which for book-keeping is the number you want anyway.
-  - If Yahoo ever breaks for good, Finnhub's free tier (60 calls/min, real-time US equities, needs a signup for a key) is the drop-in for equities.
+- **Quote sources**: Finnhub is a real API with a TOS and documented limits (60/min free); the server keeps a shared token bucket under that and caches quotes 30 s, so a burst of tool calls from several chats can't trip it. Bank of Canada Valet and ECB/Frankfurter are official and keyless, one rate per business day. Yahoo Finance was tried first and dropped: its endpoint is undocumented, TLS-fingerprints clients, and hard-blocks cloud egress IPs (Render's included) for 13–40+ min at a time.
 - Free-tier Render sleeps after idle; first call after a nap takes ~30s. Fine for this use case.
